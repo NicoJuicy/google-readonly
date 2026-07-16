@@ -17,6 +17,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/open-cli-collective/cli-common/credstore"
 	"golang.org/x/oauth2"
@@ -71,7 +73,57 @@ func open(overwrite, runMigration bool) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	runMigration = applyCredentialRefOverride(cfg, runMigration)
 	return openWith(cfg, overwrite, runMigration)
+}
+
+// applyCredentialRefOverride applies the per-invocation credential-ref override
+// to cfg in place and returns the effective runMigration decision. A
+// --ref flag or <SERVICE>_CREDENTIAL_REF env (precedence: flag > env > config)
+// selects the ref for this process, so concurrent processes can each target a
+// different account without racing on the shared config.yml. A present override
+// also FORCES runMigration=false: the one-time §1.8 migration only ever targets
+// the configured/default ref (running it against an arbitrary ref could write
+// the default's legacy data under the wrong service/profile — the same reason
+// OpenRef skips it). With no override, cfg is untouched and the caller's
+// runMigration is returned unchanged. Split out of open() so this
+// safety-critical swap+suppression is directly testable without
+// config.LoadConfigForRuntime or a real keyring.
+func applyCredentialRefOverride(cfg *config.Config, runMigration bool) bool {
+	if ref, overridden := effectiveRef(cfg.CredentialRef); overridden {
+		cfg.CredentialRef = ref
+		return false
+	}
+	return runMigration
+}
+
+// CredentialRefEnvVar is the per-invocation credential-ref override env var
+// (e.g. "GOOGLE_READONLY_CREDENTIAL_REF"). It is derived from gro's service so
+// it always tracks the same <SERVICE>_ prefix credstore uses for the backend
+// env var, and is never hard-coded (§1.3). Exported so the cobra layer can name
+// it in the --ref flag's help text.
+func CredentialRefEnvVar() string {
+	service, _, err := credstore.ParseRef(config.DefaultCredentialRef)
+	if err != nil {
+		// DefaultCredentialRef is a compile-time-valid ref; unreachable.
+		return ""
+	}
+	return strings.TrimSuffix(credstore.BackendEnvVar(service), "_KEYRING_BACKEND") + "_CREDENTIAL_REF"
+}
+
+// effectiveRef applies the per-invocation credential-ref precedence
+// (--ref flag > <SERVICE>_CREDENTIAL_REF env > config credential_ref) and
+// reports whether an explicit override was supplied. Mirrors the --backend
+// precedence chain. When overridden is true, the caller must skip the one-time
+// §1.8 migration (see open / OpenRef).
+func effectiveRef(configRef string) (ref string, overridden bool) {
+	if v, set := GetCredentialRefOverride(); set && v != "" {
+		return v, true
+	}
+	if v := os.Getenv(CredentialRefEnvVar()); v != "" {
+		return v, true
+	}
+	return configRef, false
 }
 
 // OpenRef opens a store against an explicit ref instead of config.yml's
